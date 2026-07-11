@@ -20,6 +20,7 @@ package input
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mitchellh/hashstructure"
@@ -31,12 +32,77 @@ import (
 	"github.com/elastic/beats/libbeat/monitoring"
 )
 
+// AdaptiveScanIntervalFunc 根据 Runner 实例标识、配置的基础扫描周期和上一轮扫描耗时，
+// 计算下一轮扫描周期。多个 Runner 会并发调用该函数，回调实现必须保证并发安全且快速返回。
+type AdaptiveScanIntervalFunc func(inputID uint64, base, lastScan time.Duration) time.Duration
+
+// AdaptiveScanAppliedFunc 接收 Beats 归一化后的最终扫描周期。
+// requested 是上层计算值，applied 是 Runner 实际用于等待的值；该回调同样必须并发安全且快速返回。
+type AdaptiveScanAppliedFunc func(inputID uint64, base, requested, applied, lastScan time.Duration)
+
+// AdaptiveScanHooks 将周期计算与最终结果通知绑定为同一代配置，避免 Reload 时新旧回调错配。
+type AdaptiveScanHooks struct {
+	Interval AdaptiveScanIntervalFunc
+	Applied  AdaptiveScanAppliedFunc
+}
+
 var (
 	inputList = monitoring.NewUniqueList()
+
+	// 锁只保护整组 hooks 的替换和读取，回调本身在锁外执行，
+	// 避免慢回调长期阻塞配置更新，也避免回调内部更新钩子时发生死锁。
+	adaptiveScanHookSet = struct {
+		sync.RWMutex
+		hooks AdaptiveScanHooks
+	}{}
+	// 原 Runner.ID 是配置哈希，相同配置的新旧 Runner 在异步 Reload 时可能短暂重叠，
+	// 因此使用进程内唯一序号隔离两个实例的自适应状态。
+	adaptiveScanRunnerSequence uint64
 )
 
 func init() {
 	monitoring.NewFunc(monitoring.GetNamespace("state").GetRegistry(), "input", inputList.Report, monitoring.Report)
+}
+
+// SetAdaptiveScanHooks 原子替换进程级自适应扫描 hooks，传入零值时恢复使用配置的扫描周期。
+// 该方法不是同步屏障：调用返回时，替换前已被 Runner 取出的旧回调仍可能正在执行，
+// 因此调用方必须保证回调持有的状态可被并发访问，且在旧回调退出前仍然有效。
+func SetAdaptiveScanHooks(hooks AdaptiveScanHooks) {
+	adaptiveScanHookSet.Lock()
+	adaptiveScanHookSet.hooks = hooks
+	adaptiveScanHookSet.Unlock()
+}
+
+// SetAdaptiveScanIntervalFunc 兼容仅设置周期计算回调的调用方，不注册最终结果通知。
+func SetAdaptiveScanIntervalFunc(fn AdaptiveScanIntervalFunc) {
+	SetAdaptiveScanHooks(AdaptiveScanHooks{Interval: fn})
+}
+
+func nextScanInterval(inputID uint64, base, lastScan time.Duration) time.Duration {
+	// 一次复制整组 hooks，确保本轮计算和通知始终来自同一代配置。
+	adaptiveScanHookSet.RLock()
+	hooks := adaptiveScanHookSet.hooks
+	adaptiveScanHookSet.RUnlock()
+
+	if hooks.Interval == nil {
+		return base
+	}
+
+	requested := hooks.Interval(inputID, base, lastScan)
+	applied := requested
+	// 非正周期或超过配置上限都回退到原配置，保证自适应扫描不会劣化既有扫描频率。
+	if requested <= 0 || requested > base {
+		applied = base
+	}
+	if hooks.Applied != nil {
+		hooks.Applied(inputID, base, requested, applied, lastScan)
+	}
+	return applied
+}
+
+func nextAdaptiveScanRunnerID() uint64 {
+	// uint64 零值即计数器初始值，首次 Add 返回 1，无需额外初始化。
+	return atomic.AddUint64(&adaptiveScanRunnerSequence, 1)
 }
 
 // Input is the interface common to all input
@@ -56,6 +122,9 @@ type Runner struct {
 	ID       uint64
 	Once     bool
 	beatDone chan struct{}
+
+	// 仅用于关联进程内本次 Runner 生命周期对应的自适应状态。
+	adaptiveScanID uint64
 }
 
 // New instantiates a new Runner
@@ -67,11 +136,12 @@ func New(
 	dynFields *common.MapStrPointer,
 ) (*Runner, error) {
 	input := &Runner{
-		config:   defaultConfig,
-		wg:       &sync.WaitGroup{},
-		done:     make(chan struct{}),
-		Once:     false,
-		beatDone: beatDone,
+		config:         defaultConfig,
+		wg:             &sync.WaitGroup{},
+		done:           make(chan struct{}),
+		Once:           false,
+		beatDone:       beatDone,
+		adaptiveScanID: nextAdaptiveScanRunnerID(),
 	}
 
 	var err error
@@ -136,24 +206,49 @@ func (p *Runner) Start() {
 
 // Run starts scanning through all the file paths and fetch the related files. Start a harvester for each file
 func (p *Runner) Run() {
-	// Initial input run
+	// 启动后仍然立即执行首轮扫描，同时记录真实耗时，作为下一轮周期的计算依据。
+	scanStarted := time.Now()
 	p.input.Run()
+	lastScan := time.Since(scanStarted)
 
-	// Shuts down after the first complete run of all input
+	// Once 模式只执行首轮扫描，不需要计算一个永远不会使用的下一轮周期。
 	if p.Once {
 		return
 	}
 
 	for {
+		// 先检查停止信号，避免 Runner 已停止时仍调用一次外部周期计算回调。
 		select {
 		case <-p.done:
 			logp.Info("input ticker stopped")
 			return
-		case <-time.After(p.config.ScanFrequency):
+		default:
+		}
+
+		// 每轮重新读取钩子，使运行中的 Runner 无需重建即可响应配置 Reload。
+		interval := nextScanInterval(p.AdaptiveScanID(), p.config.ScanFrequency, lastScan)
+		// 前一个 select 只负责在计算前快速退出；这里负责在实际等待期间响应停止信号。
+		select {
+		case <-p.done:
+			logp.Info("input ticker stopped")
+			return
+		case <-time.After(interval):
 			logp.Debug("input", "Run input")
+			scanStarted = time.Now()
 			p.input.Run()
+			lastScan = time.Since(scanStarted)
 		}
 	}
+}
+
+// AdaptiveScanID 返回自适应扫描状态使用的进程内唯一实例标识。
+// 它与基于配置哈希生成的 ID 分离，避免异步 Reload 期间相同配置的新旧 Runner 状态冲突。
+// 对测试或旧代码直接构造、尚未分配实例标识的 Runner，回退使用原 ID。
+func (p *Runner) AdaptiveScanID() uint64 {
+	if p.adaptiveScanID != 0 {
+		return p.adaptiveScanID
+	}
+	return p.ID
 }
 
 // Reload reload the input for states
