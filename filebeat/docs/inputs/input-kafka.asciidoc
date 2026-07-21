@@ -1,0 +1,95 @@
+:type: kafka
+
+[id="{beatname_lc}-input-{type}"]
+=== Kafka input
+
+++++
+<titleabbrev>Kafka</titleabbrev>
+++++
+
+experimental[]
+
+Use the `kafka` input to consume messages from one or more Kafka topics as a
+consumer group member.
+
+Example configuration using SASL/SCRAM-SHA-512 over TLS:
+
+["source","yaml",subs="attributes"]
+----
+{beatname_lc}.inputs:
+- type: kafka
+  hosts: ["kafka-1:9093", "kafka-2:9093"]
+  topics: ["logs"]
+  group_id: "{beatname_lc}-logs"
+  username: "collector"
+  password: "${KAFKA_PASSWORD}"
+  sasl_mechanism: "SCRAM-SHA-512"
+  ssl.certificate_authorities: ["/etc/pki/kafka/ca.pem"]
+----
+
+==== Configuration options
+
+The `kafka` input supports the following configuration options plus the
+<<{beatname_lc}-input-{type}-common-options>> described later.
+
+[float]
+[[kafka-input-hosts]]
+===== `hosts`
+
+The list of Kafka broker addresses used to fetch cluster metadata.
+
+[float]
+[[kafka-input-topics]]
+===== `topics`
+
+The list of Kafka topics to consume.
+
+[float]
+[[kafka-input-group-id]]
+===== `group_id`
+
+The Kafka consumer group ID. Consumers using the same group ID share topic
+partitions.
+
+[float]
+[[kafka-input-initial-offset]]
+===== `initial_offset`
+
+The initial offset used when the consumer group has no committed offset. Valid
+values are `oldest` and `newest`. The default is `newest`.
+
+[float]
+[[kafka-input-username]]
+===== `username`
+
+The username for connecting to Kafka. Configuring a username enables SASL
+authentication and requires `password`.
+
+[float]
+[[kafka-input-password]]
+===== `password`
+
+The password for connecting to Kafka.
+
+[float]
+[[kafka-input-sasl-mechanism]]
+===== `sasl_mechanism`
+
+The SASL mechanism used to authenticate with Kafka. Valid values are `PLAIN`,
+`SCRAM-SHA-256`, and `SCRAM-SHA-512`. The value is case-insensitive. The
+default is `PLAIN`.
+
+For `SASL_SSL`, configure `username`, `password`, and `sasl_mechanism` together
+with the <<configuration-ssl,SSL settings>>. Without SSL, SASL credentials and
+traffic are not protected by TLS.
+
+[float]
+[[kafka-input-version]]
+===== `version`
+
+The Kafka protocol version expected by the input. The default is `1.0.0`.
+
+[id="{beatname_lc}-input-{type}-common-options"]
+include::../inputs/input-common-options.asciidoc[]
+
+:type!:

@@ -20,6 +20,8 @@ package kafka
 import (
 	"testing"
 
+	"github.com/Shopify/sarama"
+
 	"github.com/elastic/beats/libbeat/common"
 )
 
@@ -47,6 +49,85 @@ func TestConfigAcceptValid(t *testing.T) {
 			}
 			if _, err := newSaramaConfig(cfg); err != nil {
 				t.Fatalf("Failure creating sarama config: %v", err)
+			}
+		})
+	}
+}
+
+func TestSASLMechanismConfig(t *testing.T) {
+	tests := map[string]struct {
+		config    common.MapStr
+		mechanism sarama.SASLMechanism
+		scram     bool
+		wantErr   bool
+	}{
+		"no sasl config": {
+			config:    common.MapStr{},
+			mechanism: "",
+		},
+		"plain by default when username set": {
+			config: common.MapStr{
+				"username": "user",
+				"password": "pass",
+			},
+			mechanism: sarama.SASLTypePlaintext,
+		},
+		"scram sha 512": {
+			config: common.MapStr{
+				"username":       "user",
+				"password":       "pass",
+				"sasl_mechanism": "SCRAM-SHA-512",
+			},
+			mechanism: sarama.SASLTypeSCRAMSHA512,
+			scram:     true,
+		},
+		"scram sha 256 lowercase": {
+			config: common.MapStr{
+				"username":       "user",
+				"password":       "pass",
+				"sasl_mechanism": "scram-sha-256",
+			},
+			mechanism: sarama.SASLTypeSCRAMSHA256,
+			scram:     true,
+		},
+		"unsupported mechanism": {
+			config: common.MapStr{
+				"username":       "user",
+				"password":       "pass",
+				"sasl_mechanism": "GSSAPI",
+			},
+			wantErr: true,
+		},
+	}
+
+	for name, test := range tests {
+		test := test
+		t.Run(name, func(t *testing.T) {
+			c := common.MustNewConfigFrom(test.config)
+			c.SetString("hosts", 0, "localhost")
+			cfg, err := readConfig(c)
+			if test.wantErr {
+				if err == nil {
+					_, err = newSaramaConfig(cfg)
+				}
+				if err == nil {
+					t.Fatal("expected error for unsupported sasl mechanism, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Can not create test configuration: %v", err)
+			}
+
+			k, err := newSaramaConfig(cfg)
+			if err != nil {
+				t.Fatalf("Failure creating sarama config: %v", err)
+			}
+			if k.Net.SASL.Mechanism != test.mechanism {
+				t.Fatalf("unexpected sasl mechanism: got %q, want %q", k.Net.SASL.Mechanism, test.mechanism)
+			}
+			if scram := k.Net.SASL.SCRAMClientGeneratorFunc != nil; scram != test.scram {
+				t.Fatalf("unexpected scram generator presence: got %v, want %v", scram, test.scram)
 			}
 		})
 	}

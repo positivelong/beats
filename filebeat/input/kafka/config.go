@@ -50,6 +50,7 @@ type kafkaInputConfig struct {
 	TLS                      *tlscommon.Config `config:"ssl"`
 	Username                 string            `config:"username"`
 	Password                 string            `config:"password"`
+	Mechanism                string            `config:"sasl_mechanism"`
 	ExpandEventListFromField string            `config:"expand_event_list_from_field"`
 }
 
@@ -141,6 +142,10 @@ func (c *kafkaInputConfig) Validate() error {
 	if c.Username != "" && c.Password == "" {
 		return fmt.Errorf("password must be set when username is configured")
 	}
+
+	if _, err := kafka.NormalizeSASLMechanism(c.Mechanism); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -178,10 +183,8 @@ func newSaramaConfig(config kafkaInputConfig) (*sarama.Config, error) {
 		k.Net.TLS.Config = tls.BuildModuleConfig("")
 	}
 
-	if config.Username != "" {
-		k.Net.SASL.Enable = true
-		k.Net.SASL.User = config.Username
-		k.Net.SASL.Password = config.Password
+	if err := kafka.ConfigureSASL(k, config.Username, config.Password, config.Mechanism); err != nil {
+		return nil, err
 	}
 
 	// configure client ID

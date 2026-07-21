@@ -846,12 +846,23 @@ See <<kafka-compatibility>> for information on supported versions.
 
 ===== `username`
 
-The username for connecting to Kafka. If username is configured, the password
-must be configured as well. Only SASL/PLAIN is supported.
+The username for connecting to Kafka. If `username` is configured, `password`
+must be configured as well. Authentication uses the mechanism selected by
+`sasl_mechanism`.
 
 ===== `password`
 
 The password for connecting to Kafka.
+
+===== `sasl_mechanism`
+
+The SASL mechanism used to authenticate with Kafka. Valid values are `PLAIN`,
+`SCRAM-SHA-256`, and `SCRAM-SHA-512`. The value is case-insensitive. The
+default is `PLAIN`.
+
+For `SASL_SSL`, configure `username`, `password`, and `sasl_mechanism` together
+with the <<configuration-ssl,SSL settings>>. Without SSL, SASL credentials and
+traffic are not protected by TLS.
 
 [[topic-option-kafka]]
 ===== `topic`
