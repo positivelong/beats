@@ -56,6 +56,7 @@ type kafkaConfig struct {
 	ChanBufferSize   int                       `config:"channel_buffer_size" validate:"min=1"`
 	Username         string                    `config:"username"`
 	Password         string                    `config:"password"`
+	Mechanism        string                    `config:"sasl_mechanism"`
 	Codec            codec.Config              `config:"codec"`
 }
 
@@ -133,6 +134,10 @@ func (c *kafkaConfig) Validate() error {
 		return fmt.Errorf("password must be set when username is configured")
 	}
 
+	if _, err := kafka.NormalizeSASLMechanism(c.Mechanism); err != nil {
+		return err
+	}
+
 	if c.Compression == "gzip" {
 		lvl := c.CompressionLevel
 		if lvl != sarama.CompressionLevelDefault && !(0 <= lvl && lvl <= 9) {
@@ -169,10 +174,8 @@ func newSaramaConfig(config *kafkaConfig) (*sarama.Config, error) {
 		k.Net.TLS.Config = tls.BuildModuleConfig("")
 	}
 
-	if config.Username != "" {
-		k.Net.SASL.Enable = true
-		k.Net.SASL.User = config.Username
-		k.Net.SASL.Password = config.Password
+	if err := kafka.ConfigureSASL(k, config.Username, config.Password, config.Mechanism); err != nil {
+		return nil, err
 	}
 
 	// configure metadata update properties

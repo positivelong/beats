@@ -482,8 +482,11 @@ output.elasticsearch:
     #hash: []
 
   # Authentication details. Password is required if username is set.
+  # Valid sasl_mechanism values are PLAIN, SCRAM-SHA-256, and SCRAM-SHA-512.
+  # The default is PLAIN.
   #username: ''
   #password: ''
+  #sasl_mechanism: 'PLAIN'
 
   # Kafka version beatname is assumed to run against. Defaults to the "1.0.0".
   #version: '1.0.0'

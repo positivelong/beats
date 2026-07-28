@@ -27,13 +27,13 @@
 			"revisionTime": "2018-07-23T16:30:02Z"
 		},
 		{
-			"checksumSHA1": "6vi2DINjmqIqJSZfbkdpI8nNrVY=",
+			"checksumSHA1": "Vb1PD+ncV5EOIWcDBVXF1qzer10=",
 			"path": "github.com/Shopify/sarama",
-			"revision": "03a43f93cd29dc549e6d9b11892795c206f9c38c",
-			"revisionTime": "2019-01-10T17:48:46Z",
+			"revision": "ea9ab1c316850bee881a07bb2555ee8a685cd4b6",
+			"revisionTime": "2019-04-29T14:31:48Z",
 			"tree": true,
-			"version": "v1.20.1",
-			"versionExact": "v1.20.1"
+			"version": "v1.22.1",
+			"versionExact": "v1.22.1"
 		},
 		{
 			"checksumSHA1": "DYv6Q1+VfnUVxMwvk5IshAClLvw=",
@@ -2012,6 +2012,24 @@
 			"path": "github.com/urso/qcgen",
 			"revision": "0b059e7db4f40a062ca3d975b7500c6a0a968d87",
 			"revisionTime": "2018-01-31T10:30:24Z"
+		},
+		{
+			"checksumSHA1": "uE78U34xjlJ815TX/bhLROkjmeI=",
+			"path": "github.com/xdg/scram",
+			"revision": "7eeb5667e42c09cb51bf7b7c28aea8c56767da90",
+			"revisionTime": "2018-08-14T20:50:39Z",
+			"tree": true,
+			"version": "v0.0.1",
+			"versionExact": "v0.0.1"
+		},
+		{
+			"checksumSHA1": "lBUiRseyka10o3r/oaQMNlL7sQE=",
+			"path": "github.com/xdg/stringprep",
+			"revision": "bd625b8dc1e3b0f57412280ccbcc317f0c69d8db",
+			"revisionTime": "2018-02-20T22:05:24Z",
+			"tree": true,
+			"version": "v1.0.0",
+			"versionExact": "v1.0.0"
 		},
 		{
 			"checksumSHA1": "Und+nhgN1YsNWvd0aDYO+0cMcAo=",
