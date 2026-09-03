@@ -338,8 +338,9 @@ func (h *FileHarvester) Run() {
 				break L
 			}
 		}
-		h.closeFile()
+		h.stopReader()
 		h.readerDone.Wait()
+		h.closeFile()
 		h.Close()
 	}()
 
@@ -373,12 +374,9 @@ func (h *FileHarvester) Run() {
 				h.state.Offset = offset
 				logp.Info("reload file offset to (%d) success. file:%s", offset, h.state.Source)
 
-				// until reader close, only one reader can running
-				h.readerDone.Wait()
-
 				// read file
 				h.readerDone.Add(1)
-				go h.loopRead()
+				go h.loopRead(h.reader)
 			} else {
 				h.forwardersLock.Lock()
 				for _, reuseReader := range h.forwarders {
@@ -406,7 +404,7 @@ func (h *FileHarvester) Run() {
 }
 
 // loopRead: loop read file, then forward to receive
-func (h *FileHarvester) loopRead() {
+func (h *FileHarvester) loopRead(sourceReader reader.Reader) {
 	defer func() {
 		h.readerDone.Done()
 		logp.Info("loop Read quit. because file(%s) is close.", h.state.Source)
@@ -417,9 +415,12 @@ func (h *FileHarvester) loopRead() {
 		case <-h.done:
 			return
 		default:
-			message, err := h.reader.Next()
+			message, err := sourceReader.Next()
 			if err != nil {
 				logp.Info("read message error: %v, file:%s", err, h.state.Source)
+				if err == ErrClosed {
+					return
+				}
 
 				// 文件被关闭异常，不需要转发到外层。 在调用Close()后会引发，属于内部错误
 				if pathErr, ok := err.(*os.PathError); ok {
@@ -502,6 +503,13 @@ func (h *FileHarvester) Close() {
 	h.closeOnce.Do(func() {
 		close(h.done)
 	})
+}
+
+// stopReader wakes a reader blocked at EOF without closing the FD it is using.
+func (h *FileHarvester) stopReader() {
+	if h.log != nil {
+		h.log.Close()
+	}
 }
 
 // Setup: 打开文件FD，首次执行会直接转到第一个state.offset
@@ -617,7 +625,10 @@ func (h *FileHarvester) reloadFileOffset() (int64, error) {
 		return h.state.Offset, nil
 	}
 
-	//重新打开文件
+	// Stop the old reader before closing its FD. Closing the FD first races with
+	// loopRead and causes the read path to return "file already closed".
+	h.stopReader()
+	h.readerDone.Wait()
 	h.closeFile()
 	h.state.Offset = minOffset
 	return minOffset, h.Setup()
