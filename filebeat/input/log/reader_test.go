@@ -32,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -151,7 +152,7 @@ func TestReloadFileOffsetStopsReaderBeforeClosingFD(t *testing.T) {
 	assert.True(t, oldSource.wasClosed())
 }
 
-func TestReloadFileOffsetDoesNotStartDuplicateReader(t *testing.T) {
+func TestReloadFileOffsetRestartsSingleReaderWhenOffsetUnchanged(t *testing.T) {
 	logFile := filepath.Join(t.TempDir(), "reload-noop.log")
 	assert.NoError(t, os.WriteFile(logFile, []byte("first line\n"), 0o600))
 
@@ -182,14 +183,118 @@ func TestReloadFileOffsetDoesNotStartDuplicateReader(t *testing.T) {
 		t.Fatal("reader did not start")
 	}
 
-	offset, reopened, err := fileHarvester.reloadFileOffset()
+	oldLog := fileHarvester.log
+	reloadDone := make(chan struct{})
+	var offset int64
+	var reopened bool
+	go func() {
+		offset, reopened, err = fileHarvester.reloadFileOffset()
+		close(reloadDone)
+	}()
+
+	select {
+	case <-oldLog.done:
+	case <-time.After(time.Second):
+		t.Fatal("active reader was not stopped before reload")
+	}
+	close(blockedReader.release)
+	select {
+	case <-reloadDone:
+	case <-time.After(time.Second):
+		t.Fatal("reload did not finish after the old reader exited")
+	}
 	assert.NoError(t, err)
 	assert.Equal(t, fileHarvester.state.Offset, offset)
-	assert.False(t, reopened)
-	assert.False(t, fileHarvester.startReader(), "an active reader must not be started twice")
+	assert.True(t, reopened)
+	assert.True(t, fileHarvester.startReader(), "reloaded reader must start exactly once")
+	assert.False(t, fileHarvester.startReader(), "reloaded reader must not be started twice")
+}
 
-	close(blockedReader.release)
-	fileHarvester.readerDone.Wait()
+func TestReloadFileOffsetPreservesForwarderOffsets(t *testing.T) {
+	for _, ludicrousMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ludicrous_mode=%t", ludicrousMode), func(t *testing.T) {
+			testReloadFileOffsetPreservesForwarderOffsets(t, ludicrousMode)
+		})
+	}
+}
+
+func testReloadFileOffsetPreservesForwarderOffsets(t *testing.T, ludicrousMode bool) {
+	logFile := filepath.Join(t.TempDir(), "reload-batch.log")
+	allLines := make([]string, 10)
+	var content strings.Builder
+	for i := range allLines {
+		allLines[i] = fmt.Sprintf("msg-%06d", i)
+		content.WriteString(allLines[i])
+		content.WriteByte('\n')
+	}
+	assert.NoError(t, os.WriteFile(logFile, []byte(content.String()), 0o600))
+
+	lineBytes := int64(len(allLines[0]) + 1)
+	aOffset := 3 * lineBytes
+	harvester, err := getHarvester(logFile, aOffset)
+	assert.NoError(t, err)
+	harvester.config.LudicrousMode = ludicrousMode
+	harvester.config.BufferSize = 8 * int(lineBytes)
+
+	forwarderA := newBufferedReuseHarvester(harvester, aOffset)
+	fileHarvester, err := newFileHarvester(forwarderA)
+	assert.NoError(t, err)
+	forwarderA.fileReader = fileHarvester
+	forwarderB := newBufferedReuseHarvester(harvester, 0)
+	forwarderB.fileReader = fileHarvester
+	fileHarvester.forwarders[forwarderA.HarvesterID] = forwarderA
+	fileHarvester.forwarders[forwarderB.HarvesterID] = forwarderB
+	t.Cleanup(func() {
+		fileHarvester.stopReader()
+		fileHarvester.readerDone.Wait()
+		fileHarvester.closeFile()
+		fileHarvester.Close()
+	})
+
+	offset, reopened, err := fileHarvester.reloadFileOffset()
+	assert.NoError(t, err)
+	assert.True(t, reopened)
+	assert.Equal(t, int64(0), offset)
+	fileHarvester.state.Offset = offset
+
+	fileSize := int64(len(content.String()))
+	for fileHarvester.state.Offset < fileSize {
+		message, readErr := fileHarvester.reader.Next()
+		if !assert.NoError(t, readErr) {
+			return
+		}
+		if message.Bytes <= 0 {
+			t.Fatalf("reader returned a non-positive byte count: %d", message.Bytes)
+		}
+		fileHarvester.forward(message, nil)
+		fileHarvester.state.Offset += int64(message.Bytes)
+	}
+
+	assert.Equal(t, allLines[3:], bufferedLines(forwarderA.message))
+	assert.Equal(t, allLines, bufferedLines(forwarderB.message))
+	assert.Equal(t, fileSize, forwarderA.State.Offset)
+	assert.Equal(t, fileSize, forwarderB.State.Offset)
+}
+
+func newBufferedReuseHarvester(harvester *Harvester, offset int64) *ReuseHarvester {
+	state := harvester.state
+	state.Offset = offset
+	return &ReuseHarvester{
+		HarvesterID: uuid.Must(uuid.NewV4()),
+		Config:      harvester.config,
+		State:       state,
+		done:        make(chan struct{}),
+		message:     make(chan ReuseMessage, 16),
+	}
+}
+
+func bufferedLines(messages chan ReuseMessage) []string {
+	lines := make([]string, 0)
+	for len(messages) > 0 {
+		message := <-messages
+		lines = append(lines, strings.Split(string(message.message.Content), "\n")...)
+	}
+	return lines
 }
 
 func TestReuseReadLine(t *testing.T) {
