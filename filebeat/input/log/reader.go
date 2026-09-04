@@ -252,6 +252,8 @@ type FileHarvester struct {
 	encoding        encoding.Encoding
 
 	readerDone sync.WaitGroup
+	readerLock sync.Mutex
+	readerRun  bool
 
 	//harvester
 	forwarders     map[uuid.UUID]*ReuseHarvester
@@ -366,17 +368,18 @@ func (h *FileHarvester) Run() {
 				h.forwardersLock.Unlock()
 				newForwarders = make([]*ReuseHarvester, 0)
 
-				offset, err := h.reloadFileOffset()
+				offset, reopened, err := h.reloadFileOffset()
 				if err != nil {
 					logp.Err("reload file offset err: %v, file:%s", err, h.state.Source)
 					return
 				}
 				h.state.Offset = offset
-				logp.Info("reload file offset to (%d) success. file:%s", offset, h.state.Source)
+				logp.Info("reload file offset to (%d) success. reopened:%v, file:%s", offset, reopened, h.state.Source)
 
-				// read file
-				h.readerDone.Add(1)
-				go h.loopRead(h.reader)
+				// The first forwarder starts the reader without reopening it. Later
+				// forwarders may also join without changing the offset, so starting
+				// the reader must be idempotent.
+				h.startReader()
 			} else {
 				h.forwardersLock.Lock()
 				for _, reuseReader := range h.forwarders {
@@ -403,9 +406,28 @@ func (h *FileHarvester) Run() {
 	}
 }
 
+// startReader starts at most one read loop for the current reader instance.
+func (h *FileHarvester) startReader() bool {
+	h.readerLock.Lock()
+	defer h.readerLock.Unlock()
+
+	if h.readerRun {
+		return false
+	}
+
+	sourceReader := h.reader
+	h.readerRun = true
+	h.readerDone.Add(1)
+	go h.loopRead(sourceReader)
+	return true
+}
+
 // loopRead: loop read file, then forward to receive
 func (h *FileHarvester) loopRead(sourceReader reader.Reader) {
 	defer func() {
+		h.readerLock.Lock()
+		h.readerRun = false
+		h.readerLock.Unlock()
 		h.readerDone.Done()
 		logp.Info("loop Read quit. because file(%s) is close.", h.state.Source)
 	}()
@@ -601,10 +623,10 @@ func (h *FileHarvester) validateFile(f *os.File) error {
 	return nil
 }
 
-func (h *FileHarvester) reloadFileOffset() (int64, error) {
+func (h *FileHarvester) reloadFileOffset() (int64, bool, error) {
 	hasState := h.source.HasState()
 	if !hasState {
-		return h.state.Offset, nil
+		return h.state.Offset, false, nil
 	}
 
 	var minOffset int64
@@ -622,7 +644,7 @@ func (h *FileHarvester) reloadFileOffset() (int64, error) {
 	}
 
 	if h.state.Offset == minOffset {
-		return h.state.Offset, nil
+		return h.state.Offset, false, nil
 	}
 
 	// Stop the old reader before closing its FD. Closing the FD first races with
@@ -631,7 +653,7 @@ func (h *FileHarvester) reloadFileOffset() (int64, error) {
 	h.readerDone.Wait()
 	h.closeFile()
 	h.state.Offset = minOffset
-	return minOffset, h.Setup()
+	return minOffset, true, h.Setup()
 }
 
 func (h *FileHarvester) initFileOffset(file *os.File) (int64, error) {

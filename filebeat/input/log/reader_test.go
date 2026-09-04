@@ -25,6 +25,7 @@ import (
 	"github.com/elastic/beats/filebeat/harvester"
 	"github.com/elastic/beats/filebeat/input/file"
 	"github.com/elastic/beats/libbeat/common"
+	"github.com/elastic/beats/libbeat/reader"
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
 	"math/rand"
@@ -44,43 +45,42 @@ var lines = []string{
 
 type closeTrackingSource struct {
 	harvester.Source
-	readStarted    chan struct{}
-	mu             sync.Mutex
-	closed         bool
-	readAfterClose bool
-}
-
-func (s *closeTrackingSource) Read(buf []byte) (int, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.readAfterClose = true
-	}
-	s.mu.Unlock()
-
-	select {
-	case s.readStarted <- struct{}{}:
-	default:
-	}
-	return s.Source.Read(buf)
+	mu      sync.Mutex
+	closed  bool
+	closeCh chan struct{}
 }
 
 func (s *closeTrackingSource) Close() error {
 	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
+	close(s.closeCh)
 	return s.Source.Close()
-}
-
-func (s *closeTrackingSource) wasReadAfterClose() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.readAfterClose
 }
 
 func (s *closeTrackingSource) wasClosed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closed
+}
+
+type blockingReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingReader() *blockingReader {
+	return &blockingReader{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (r *blockingReader) Next() (reader.Message, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return reader.Message{}, ErrClosed
 }
 
 func TestReloadFileOffsetStopsReaderBeforeClosingFD(t *testing.T) {
@@ -90,8 +90,6 @@ func TestReloadFileOffsetStopsReaderBeforeClosingFD(t *testing.T) {
 
 	harvester, err := getHarvester(logFile, int64(len(content)))
 	assert.NoError(t, err)
-	harvester.config.Backoff = time.Hour
-
 	reuseReader := &ReuseHarvester{
 		HarvesterID: harvester.id,
 		Config:      harvester.config,
@@ -107,8 +105,8 @@ func TestReloadFileOffsetStopsReaderBeforeClosingFD(t *testing.T) {
 	})
 
 	oldSource := &closeTrackingSource{
-		Source:      fileHarvester.source,
-		readStarted: make(chan struct{}, 1),
+		Source:  fileHarvester.source,
+		closeCh: make(chan struct{}),
 	}
 	fileHarvester.source = oldSource
 	fileHarvester.log.fs = oldSource
@@ -117,19 +115,81 @@ func TestReloadFileOffsetStopsReaderBeforeClosingFD(t *testing.T) {
 		State:       file.State{Offset: 0},
 	}
 
-	fileHarvester.readerDone.Add(1)
-	go fileHarvester.loopRead(fileHarvester.reader)
+	oldLog := fileHarvester.log
+	blockedReader := newBlockingReader()
+	fileHarvester.reader = blockedReader
+	assert.True(t, fileHarvester.startReader())
 
 	select {
-	case <-oldSource.readStarted:
+	case <-blockedReader.started:
 	case <-time.After(time.Second):
 		t.Fatal("reader did not start")
 	}
 
-	_, err = fileHarvester.reloadFileOffset()
+	reloadDone := make(chan error, 1)
+	go func() {
+		_, _, reloadErr := fileHarvester.reloadFileOffset()
+		reloadDone <- reloadErr
+	}()
+
+	select {
+	case <-oldLog.done:
+	case <-oldSource.closeCh:
+		t.Fatal("old source was closed before the read loop was stopped")
+	case <-time.After(time.Second):
+		t.Fatal("reader stop was not requested")
+	}
+	assert.False(t, oldSource.wasClosed())
+
+	close(blockedReader.release)
+	select {
+	case err = <-reloadDone:
+	case <-time.After(time.Second):
+		t.Fatal("reload did not finish after the old reader exited")
+	}
 	assert.NoError(t, err)
 	assert.True(t, oldSource.wasClosed())
-	assert.False(t, oldSource.wasReadAfterClose(), "old reader must stop before its FD is closed")
+}
+
+func TestReloadFileOffsetDoesNotStartDuplicateReader(t *testing.T) {
+	logFile := filepath.Join(t.TempDir(), "reload-noop.log")
+	assert.NoError(t, os.WriteFile(logFile, []byte("first line\n"), 0o600))
+
+	harvester, err := getHarvester(logFile, 0)
+	assert.NoError(t, err)
+	reuseReader := &ReuseHarvester{
+		HarvesterID: harvester.id,
+		Config:      harvester.config,
+		State:       harvester.state,
+	}
+	fileHarvester, err := newFileHarvester(reuseReader)
+	assert.NoError(t, err)
+	t.Cleanup(func() {
+		fileHarvester.stopReader()
+		fileHarvester.readerDone.Wait()
+		fileHarvester.closeFile()
+		fileHarvester.Close()
+	})
+
+	blockedReader := newBlockingReader()
+	fileHarvester.reader = blockedReader
+	fileHarvester.forwarders[harvester.id] = reuseReader
+	assert.True(t, fileHarvester.startReader())
+
+	select {
+	case <-blockedReader.started:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not start")
+	}
+
+	offset, reopened, err := fileHarvester.reloadFileOffset()
+	assert.NoError(t, err)
+	assert.Equal(t, fileHarvester.state.Offset, offset)
+	assert.False(t, reopened)
+	assert.False(t, fileHarvester.startReader(), "an active reader must not be started twice")
+
+	close(blockedReader.release)
+	fileHarvester.readerDone.Wait()
 }
 
 func TestReuseReadLine(t *testing.T) {
