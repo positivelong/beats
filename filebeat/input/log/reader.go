@@ -181,7 +181,7 @@ func (m *FileReaderManager) GetFileReader(reuseReader *ReuseHarvester) (*FileHar
 				continue
 			default:
 				if fileReader.state.Offset-reuseReader.State.Offset < reuseReader.Config.ReuseMaxBytes {
-					logp.Debug("harvester reuse file reader, id: %s", id)
+					logp.Debug("harvester", "reuse file reader, id: %s", id)
 					return fileReader, nil
 				}
 			}
@@ -190,7 +190,7 @@ func (m *FileReaderManager) GetFileReader(reuseReader *ReuseHarvester) (*FileHar
 	}
 
 	// create new fileReader
-	logp.Debug("harvester use a new file reader, id: %s", id)
+	logp.Debug("harvester", "use a new file reader, id: %s", id)
 	fileReader, err := newFileHarvester(reuseReader)
 	if err != nil {
 		return nil, err
@@ -722,14 +722,30 @@ func (h *FileHarvester) reloadFileOffset() (int64, bool, error) {
 		}
 	}
 
-	if !wasRunning && h.state.Offset == minOffset {
+	boundaries := replayBoundaries(minOffset, offsets)
+	// Even without a rewind, a newly created reader must respect the other
+	// tasks' offsets before its first batch is read.
+	if !wasRunning && h.state.Offset == minOffset && len(boundaries) == 0 {
 		return h.state.Offset, false, nil
 	}
 
 	h.closeFile()
 	h.state.Offset = minOffset
-	h.replayBoundaries = replayBoundaries(minOffset, offsets)
-	return minOffset, true, h.Setup()
+	h.replayBoundaries = boundaries
+	if err := h.Setup(); err != nil {
+		return minOffset, true, err
+	}
+
+	// Encoding initialization may consume a BOM before the first message.
+	// Keep shared and forwarder progress in the same physical byte coordinates
+	// as the replay boundaries; those bytes are not included in Message.Bytes.
+	actualOffset := h.state.Offset
+	for _, reuseReader := range forwarders {
+		if reuseReader.State.Offset < actualOffset {
+			reuseReader.State.Offset = actualOffset
+		}
+	}
+	return actualOffset, true, nil
 }
 
 func replayBoundaries(minOffset int64, offsets []int64) []int64 {

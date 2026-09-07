@@ -28,6 +28,9 @@ import (
 	"github.com/elastic/beats/libbeat/reader"
 	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -212,13 +215,45 @@ func TestReloadFileOffsetRestartsSingleReaderWhenOffsetUnchanged(t *testing.T) {
 
 func TestReloadFileOffsetPreservesForwarderOffsets(t *testing.T) {
 	for _, ludicrousMode := range []bool{false, true} {
-		t.Run(fmt.Sprintf("ludicrous_mode=%t", ludicrousMode), func(t *testing.T) {
-			testReloadFileOffsetPreservesForwarderOffsets(t, ludicrousMode)
-		})
+		for _, firstFromStart := range []bool{false, true} {
+			t.Run(fmt.Sprintf("ludicrous_mode=%t/first-from-start=%t", ludicrousMode, firstFromStart), func(t *testing.T) {
+				testReplayEncodingOffsets(t, ludicrousMode, "utf-8", nil, 0, firstFromStart, false)
+			})
+		}
 	}
 }
 
-func testReloadFileOffsetPreservesForwarderOffsets(t *testing.T, ludicrousMode bool) {
+func TestReloadFileOffsetPreservesBOMOffsets(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		encoding string
+		order    unicode.Endianness
+		bom      unicode.BOMPolicy
+	}{
+		{"le", "utf-16le-bom", unicode.LittleEndian, unicode.UseBOM},
+		{"be", "utf-16be-bom", unicode.BigEndian, unicode.UseBOM},
+		{"auto-le", "utf-16-bom", unicode.LittleEndian, unicode.UseBOM},
+		{"auto-be", "utf-16-bom", unicode.BigEndian, unicode.UseBOM},
+		{"le-no-bom", "utf-16le-bom", unicode.LittleEndian, unicode.IgnoreBOM},
+		{"be-no-bom", "utf-16be-bom", unicode.BigEndian, unicode.IgnoreBOM},
+	} {
+		for _, batch := range []bool{false, true} {
+			for _, fromStart := range []bool{false, true} {
+				for _, resumed := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/batch=%t/first-from-start=%t/resumed=%t", tc.name, batch, fromStart, resumed), func(t *testing.T) {
+						bomBytes := int64(0)
+						if tc.bom == unicode.UseBOM {
+							bomBytes = 2
+						}
+						testReplayEncodingOffsets(t, batch, tc.encoding, unicode.UTF16(tc.order, tc.bom).NewEncoder(), bomBytes, fromStart, resumed)
+					})
+				}
+			}
+		}
+	}
+}
+
+func testReplayEncodingOffsets(t *testing.T, ludicrousMode bool, encodingName string, encoder transform.Transformer, bomBytes int64, firstFromStart, resumed bool) {
 	logFile := filepath.Join(t.TempDir(), "reload-batch.log")
 	allLines := make([]string, 10)
 	var content strings.Builder
@@ -227,20 +262,41 @@ func testReloadFileOffsetPreservesForwarderOffsets(t *testing.T, ludicrousMode b
 		content.WriteString(allLines[i])
 		content.WriteByte('\n')
 	}
-	assert.NoError(t, os.WriteFile(logFile, []byte(content.String()), 0o600))
+	raw := []byte(content.String())
+	if encoder != nil {
+		var err error
+		raw, _, err = transform.Bytes(encoder, raw)
+		require.NoError(t, err)
+	}
+	require.NoError(t, os.WriteFile(logFile, raw, 0o600))
 
 	lineBytes := int64(len(allLines[0]) + 1)
-	aOffset := 3 * lineBytes
+	if encoder != nil {
+		lineBytes *= 2
+	}
+	aOffset := bomBytes + 3*lineBytes
 	harvester, err := getHarvester(logFile, aOffset)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	harvester.config.LudicrousMode = ludicrousMode
 	harvester.config.BufferSize = 8 * int(lineBytes)
+	harvester.config.Encoding = encodingName
+	harvester.config.CloseEOF = true // A regression must fail, not wait forever at EOF.
 
 	forwarderA := newBufferedReuseHarvester(harvester, aOffset)
-	fileHarvester, err := newFileHarvester(forwarderA)
-	assert.NoError(t, err)
+	bOffset := int64(0)
+	bStartLine := 0
+	if resumed {
+		bOffset = bomBytes + lineBytes
+		bStartLine = 1
+	}
+	forwarderB := newBufferedReuseHarvester(harvester, bOffset)
+	first := forwarderA
+	if firstFromStart {
+		first = forwarderB
+	}
+	fileHarvester, err := newFileHarvester(first)
+	require.NoError(t, err)
 	forwarderA.fileReader = fileHarvester
-	forwarderB := newBufferedReuseHarvester(harvester, 0)
 	forwarderB.fileReader = fileHarvester
 	fileHarvester.forwarders[forwarderA.HarvesterID] = forwarderA
 	fileHarvester.forwarders[forwarderB.HarvesterID] = forwarderB
@@ -252,12 +308,19 @@ func testReloadFileOffsetPreservesForwarderOffsets(t *testing.T, ludicrousMode b
 	})
 
 	offset, reopened, err := fileHarvester.reloadFileOffset()
-	assert.NoError(t, err)
-	assert.True(t, reopened)
-	assert.Equal(t, int64(0), offset)
+	require.NoError(t, err)
+	require.True(t, reopened, "different task offsets require replay boundaries")
+	expectedOffset := bOffset
+	if expectedOffset == 0 {
+		expectedOffset = bomBytes
+	}
+	require.Equal(t, expectedOffset, offset)
+	require.Equal(t, offset, fileHarvester.state.Offset)
+	require.Equal(t, expectedOffset, forwarderB.State.Offset)
+	require.Equal(t, aOffset, forwarderA.State.Offset)
 	fileHarvester.state.Offset = offset
 
-	fileSize := int64(len(content.String()))
+	fileSize := int64(len(raw))
 	for fileHarvester.state.Offset < fileSize {
 		message, readErr := fileHarvester.reader.Next()
 		if !assert.NoError(t, readErr) {
@@ -271,7 +334,7 @@ func testReloadFileOffsetPreservesForwarderOffsets(t *testing.T, ludicrousMode b
 	}
 
 	assert.Equal(t, allLines[3:], bufferedLines(forwarderA.message))
-	assert.Equal(t, allLines, bufferedLines(forwarderB.message))
+	assert.Equal(t, allLines[bStartLine:], bufferedLines(forwarderB.message))
 	assert.Equal(t, fileSize, forwarderA.State.Offset)
 	assert.Equal(t, fileSize, forwarderB.State.Offset)
 }
@@ -285,6 +348,84 @@ func newBufferedReuseHarvester(harvester *Harvester, offset int64) *ReuseHarvest
 		State:       state,
 		done:        make(chan struct{}),
 		message:     make(chan ReuseMessage, 16),
+	}
+}
+
+// Exercise the real Run/forwarder channel/loopRead path as well as direct reload.
+func TestRunPreservesBOMOffsets(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		for _, lateJoin := range []bool{false, true} {
+			t.Run(fmt.Sprintf("batch=%t/late-join=%t", batch, lateJoin), func(t *testing.T) {
+				logFile := filepath.Join(t.TempDir(), "bom-run.log")
+				allLines := []string{"msg-000001", "msg-000002", "msg-000003", "msg-000004", "msg-000005", "msg-000006"}
+				raw, _, err := transform.Bytes(unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewEncoder(), []byte(strings.Join(allLines, "\n")+"\n"))
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(logFile, raw, 0o600))
+				aOffset := int64(2 + 3*22)
+				h, err := getHarvester(logFile, aOffset)
+				require.NoError(t, err)
+				h.config.Encoding = "utf-16le-bom"
+				h.config.LudicrousMode = batch
+				a := newBufferedReuseHarvester(h, aOffset)
+				b := newBufferedReuseHarvester(h, 0)
+				fh, err := newFileHarvester(a)
+				require.NoError(t, err)
+				a.fileReader, b.fileReader = fh, fh
+				finished := make(chan struct{})
+				go func() { defer close(finished); fh.Run() }()
+				t.Cleanup(func() {
+					fh.Close()
+					select {
+					case <-finished:
+					case <-time.After(5 * time.Second):
+						t.Error("Run did not shut down")
+					}
+				})
+				join := func(r *ReuseHarvester) {
+					select {
+					case fh.forwarder <- r:
+					case <-time.After(5 * time.Second):
+						t.Fatal("forwarder did not join")
+					}
+				}
+				collect := func(r *ReuseHarvester, count int) []string {
+					var result []string
+					timer := time.NewTimer(10 * time.Second)
+					defer timer.Stop()
+					for len(result) < count {
+						select {
+						case msg := <-r.message:
+							require.NoError(t, msg.error)
+							result = append(result, strings.Split(string(msg.message.Content), "\n")...)
+						case <-timer.C:
+							t.Fatalf("received %d of %d lines", len(result), count)
+						}
+					}
+					return result
+				}
+				join(a)
+				var aLines []string
+				if lateJoin {
+					aLines = collect(a, 3)
+				}
+				join(b)
+				bLines := collect(b, 6)
+				if !lateJoin {
+					aLines = collect(a, 3)
+				}
+				fh.Close()
+				select {
+				case <-finished:
+				case <-time.After(5 * time.Second):
+					t.Fatal("Run did not finish")
+				}
+				assert.Equal(t, allLines[3:], append(aLines, bufferedLines(a.message)...))
+				assert.Equal(t, allLines, append(bLines, bufferedLines(b.message)...))
+				assert.Equal(t, int64(len(raw)), fh.state.Offset)
+				assert.Equal(t, int64(len(raw)), a.State.Offset)
+				assert.Equal(t, int64(len(raw)), b.State.Offset)
+			})
+		}
 	}
 }
 
