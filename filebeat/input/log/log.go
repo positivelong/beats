@@ -20,6 +20,7 @@ package log
 import (
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/elastic/beats/filebeat/harvester"
@@ -35,6 +36,7 @@ type Log struct {
 	lastTimeRead time.Time
 	backoff      time.Duration
 	done         chan struct{}
+	closeOnce    sync.Once
 }
 
 // NewLog creates a new log instance to read log sources
@@ -177,8 +179,10 @@ func (f *Log) wait() {
 	}
 }
 
-// Close closes the done channel but no th the file handler
+// Close stops pending reads without closing the file handler.
 func (f *Log) Close() {
-	close(f.done)
-	// Note: File reader is not closed here because that leads to race conditions
+	f.closeOnce.Do(func() {
+		close(f.done)
+	})
+	// The file reader is not closed here because that leads to race conditions.
 }

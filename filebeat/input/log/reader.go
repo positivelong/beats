@@ -46,7 +46,9 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/mitchellh/hashstructure"
 	"golang.org/x/text/transform"
+	"io"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -179,7 +181,7 @@ func (m *FileReaderManager) GetFileReader(reuseReader *ReuseHarvester) (*FileHar
 				continue
 			default:
 				if fileReader.state.Offset-reuseReader.State.Offset < reuseReader.Config.ReuseMaxBytes {
-					logp.Debug("harvester reuse file reader, id: %s", id)
+					logp.Debug("harvester", "reuse file reader, id: %s", id)
 					return fileReader, nil
 				}
 			}
@@ -188,7 +190,7 @@ func (m *FileReaderManager) GetFileReader(reuseReader *ReuseHarvester) (*FileHar
 	}
 
 	// create new fileReader
-	logp.Debug("harvester use a new file reader, id: %s", id)
+	logp.Debug("harvester", "use a new file reader, id: %s", id)
 	fileReader, err := newFileHarvester(reuseReader)
 	if err != nil {
 		return nil, err
@@ -252,11 +254,54 @@ type FileHarvester struct {
 	encoding        encoding.Encoding
 
 	readerDone sync.WaitGroup
+	readerLock sync.Mutex
+	readerRun  bool
+
+	// replayBoundaries contains absolute source offsets that a reader created
+	// after rewinding must not cross in one batch. Each boundary belongs to a
+	// forwarder that is already ahead of the minimum replay offset.
+	replayBoundaries []int64
 
 	//harvester
 	forwarders     map[uuid.UUID]*ReuseHarvester
 	forwardersLock sync.Mutex
 	forwarder      chan *ReuseHarvester
+}
+
+// offsetBoundaryReader prevents a single read from crossing an absolute
+// source offset. Ludicrous mode batches all complete lines returned by the
+// underlying reader, so preserving forwarder offsets as read boundaries also
+// preserves them as batch boundaries after a rewind.
+type offsetBoundaryReader struct {
+	reader     io.Reader
+	offset     int64
+	boundaries []int64
+	next       int
+}
+
+func newOffsetBoundaryReader(reader io.Reader, offset int64, boundaries []int64) *offsetBoundaryReader {
+	return &offsetBoundaryReader{
+		reader:     reader,
+		offset:     offset,
+		boundaries: boundaries,
+	}
+}
+
+func (r *offsetBoundaryReader) Read(buf []byte) (int, error) {
+	for r.next < len(r.boundaries) && r.boundaries[r.next] <= r.offset {
+		r.next++
+	}
+
+	if r.next < len(r.boundaries) {
+		remaining := r.boundaries[r.next] - r.offset
+		if int64(len(buf)) > remaining {
+			buf = buf[:int(remaining)]
+		}
+	}
+
+	n, err := r.reader.Read(buf)
+	r.offset += int64(n)
+	return n, err
 }
 
 // newFileHarvester: get file harvester
@@ -317,7 +362,30 @@ func (h *FileHarvester) AddForwarder(reuseReader *ReuseHarvester) error {
 
 // HasReuseReader
 func (h *FileHarvester) HasReuseReader() bool {
-	return len(h.forwarders) > 0
+	return h.forwarderCount() > 0
+}
+
+func (h *FileHarvester) forwarderCount() int {
+	h.forwardersLock.Lock()
+	defer h.forwardersLock.Unlock()
+	return len(h.forwarders)
+}
+
+func (h *FileHarvester) removeForwarder(harvesterID uuid.UUID) {
+	h.forwardersLock.Lock()
+	delete(h.forwarders, harvesterID)
+	h.forwardersLock.Unlock()
+}
+
+func (h *FileHarvester) forwarderSnapshot() []*ReuseHarvester {
+	h.forwardersLock.Lock()
+	defer h.forwardersLock.Unlock()
+
+	forwarders := make([]*ReuseHarvester, 0, len(h.forwarders))
+	for _, reuseReader := range h.forwarders {
+		forwarders = append(forwarders, reuseReader)
+	}
+	return forwarders
 }
 
 // HasState
@@ -338,8 +406,9 @@ func (h *FileHarvester) Run() {
 				break L
 			}
 		}
-		h.closeFile()
+		h.stopReader()
 		h.readerDone.Wait()
+		h.closeFile()
 		h.Close()
 	}()
 
@@ -348,7 +417,7 @@ func (h *FileHarvester) Run() {
 	tick := time.NewTicker(3 * time.Second)
 	defer tick.Stop()
 	for {
-		logp.Info("current len of forwarder is %d, file:%s", len(h.forwarders), h.state.Source)
+		logp.Info("current len of forwarder is %d, file:%s", h.forwarderCount(), h.state.Source)
 		select {
 		case <-h.done:
 			return
@@ -365,20 +434,18 @@ func (h *FileHarvester) Run() {
 				h.forwardersLock.Unlock()
 				newForwarders = make([]*ReuseHarvester, 0)
 
-				offset, err := h.reloadFileOffset()
+				offset, reopened, err := h.reloadFileOffset()
 				if err != nil {
 					logp.Err("reload file offset err: %v, file:%s", err, h.state.Source)
 					return
 				}
 				h.state.Offset = offset
-				logp.Info("reload file offset to (%d) success. file:%s", offset, h.state.Source)
+				logp.Info("reload file offset to (%d) success. reopened:%v, file:%s", offset, reopened, h.state.Source)
 
-				// until reader close, only one reader can running
-				h.readerDone.Wait()
-
-				// read file
-				h.readerDone.Add(1)
-				go h.loopRead()
+				// The first forwarder starts the reader without reopening it. Later
+				// forwarders may also join without changing the offset, so starting
+				// the reader must be idempotent.
+				h.startReader()
 			} else {
 				h.forwardersLock.Lock()
 				for _, reuseReader := range h.forwarders {
@@ -392,7 +459,7 @@ func (h *FileHarvester) Run() {
 				h.forwardersLock.Unlock()
 			}
 
-			if len(h.forwarders) > 0 {
+			if h.forwarderCount() > 0 {
 				isEmptyForwarderTimes = 0
 			} else {
 				isEmptyForwarderTimes++
@@ -405,9 +472,34 @@ func (h *FileHarvester) Run() {
 	}
 }
 
+// startReader starts at most one read loop for the current reader instance.
+func (h *FileHarvester) startReader() bool {
+	h.readerLock.Lock()
+	defer h.readerLock.Unlock()
+
+	if h.readerRun {
+		return false
+	}
+
+	sourceReader := h.reader
+	h.readerRun = true
+	h.readerDone.Add(1)
+	go h.loopRead(sourceReader)
+	return true
+}
+
+func (h *FileHarvester) isReaderRunning() bool {
+	h.readerLock.Lock()
+	defer h.readerLock.Unlock()
+	return h.readerRun
+}
+
 // loopRead: loop read file, then forward to receive
-func (h *FileHarvester) loopRead() {
+func (h *FileHarvester) loopRead(sourceReader reader.Reader) {
 	defer func() {
+		h.readerLock.Lock()
+		h.readerRun = false
+		h.readerLock.Unlock()
 		h.readerDone.Done()
 		logp.Info("loop Read quit. because file(%s) is close.", h.state.Source)
 	}()
@@ -417,9 +509,12 @@ func (h *FileHarvester) loopRead() {
 		case <-h.done:
 			return
 		default:
-			message, err := h.reader.Next()
+			message, err := sourceReader.Next()
 			if err != nil {
 				logp.Info("read message error: %v, file:%s", err, h.state.Source)
+				if err == ErrClosed {
+					return
+				}
 
 				// 文件被关闭异常，不需要转发到外层。 在调用Close()后会引发，属于内部错误
 				if pathErr, ok := err.(*os.PathError); ok {
@@ -453,12 +548,7 @@ func (h *FileHarvester) forward(message reader.Message, err error) {
 		message: message,
 		error:   err,
 	}
-	reuseReaders := make([]*ReuseHarvester, 0)
-	h.forwardersLock.Lock()
-	for _, reuseReader := range h.forwarders {
-		reuseReaders = append(reuseReaders, reuseReader)
-	}
-	h.forwardersLock.Unlock()
+	reuseReaders := h.forwarderSnapshot()
 	for _, reuseReader := range reuseReaders {
 		select {
 		case <-h.done:
@@ -475,7 +565,7 @@ func (h *FileHarvester) forward(message reader.Message, err error) {
 				default:
 					logp.Err("log forward err: %v", err)
 				}
-				delete(h.forwarders, reuseReader.HarvesterID)
+				h.removeForwarder(reuseReader.HarvesterID)
 				continue
 			}
 			//更新采集任务进度
@@ -502,6 +592,13 @@ func (h *FileHarvester) Close() {
 	h.closeOnce.Do(func() {
 		close(h.done)
 	})
+}
+
+// stopReader wakes a reader blocked at EOF without closing the FD it is using.
+func (h *FileHarvester) stopReader() {
+	if h.log != nil {
+		h.log.Close()
+	}
 }
 
 // Setup: 打开文件FD，首次执行会直接转到第一个state.offset
@@ -593,16 +690,28 @@ func (h *FileHarvester) validateFile(f *os.File) error {
 	return nil
 }
 
-func (h *FileHarvester) reloadFileOffset() (int64, error) {
+func (h *FileHarvester) reloadFileOffset() (int64, bool, error) {
 	hasState := h.source.HasState()
 	if !hasState {
-		return h.state.Offset, nil
+		return h.state.Offset, false, nil
+	}
+
+	// Stop an active reader before taking the offset snapshot. The read loop
+	// updates both the shared offset and each forwarder offset, so calculating
+	// the minimum while it is running can create a stale replay boundary.
+	wasRunning := h.isReaderRunning()
+	if wasRunning {
+		h.stopReader()
+		h.readerDone.Wait()
 	}
 
 	var minOffset int64
+	forwarders := h.forwarderSnapshot()
+	offsets := make([]int64, 0, len(forwarders))
 	first := true
 
-	for _, reuseReader := range h.forwarders {
+	for _, reuseReader := range forwarders {
+		offsets = append(offsets, reuseReader.State.Offset)
 		if first {
 			minOffset = reuseReader.State.Offset
 			first = false
@@ -613,14 +722,46 @@ func (h *FileHarvester) reloadFileOffset() (int64, error) {
 		}
 	}
 
-	if h.state.Offset == minOffset {
-		return h.state.Offset, nil
+	boundaries := replayBoundaries(minOffset, offsets)
+	// Even without a rewind, a newly created reader must respect the other
+	// tasks' offsets before its first batch is read.
+	if !wasRunning && h.state.Offset == minOffset && len(boundaries) == 0 {
+		return h.state.Offset, false, nil
 	}
 
-	//重新打开文件
 	h.closeFile()
 	h.state.Offset = minOffset
-	return minOffset, h.Setup()
+	h.replayBoundaries = boundaries
+	if err := h.Setup(); err != nil {
+		return minOffset, true, err
+	}
+
+	// Encoding initialization may consume a BOM before the first message.
+	// Keep shared and forwarder progress in the same physical byte coordinates
+	// as the replay boundaries; those bytes are not included in Message.Bytes.
+	actualOffset := h.state.Offset
+	for _, reuseReader := range forwarders {
+		if reuseReader.State.Offset < actualOffset {
+			reuseReader.State.Offset = actualOffset
+		}
+	}
+	return actualOffset, true, nil
+}
+
+func replayBoundaries(minOffset int64, offsets []int64) []int64 {
+	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+
+	boundaries := make([]int64, 0, len(offsets))
+	for _, offset := range offsets {
+		if offset <= minOffset {
+			continue
+		}
+		if len(boundaries) > 0 && boundaries[len(boundaries)-1] == offset {
+			continue
+		}
+		boundaries = append(boundaries, offset)
+	}
+	return boundaries
 }
 
 func (h *FileHarvester) initFileOffset(file *os.File) (int64, error) {
@@ -660,7 +801,13 @@ func (h *FileHarvester) newLogFileReader() (reader.Reader, error) {
 		return nil, err
 	}
 
-	reader, err := debug.AppendReaders(h.log)
+	var sourceReader io.Reader = h.log
+	if len(h.replayBoundaries) > 0 {
+		sourceReader = newOffsetBoundaryReader(sourceReader, h.state.Offset, h.replayBoundaries)
+		h.replayBoundaries = nil
+	}
+
+	reader, err := debug.AppendReaders(sourceReader)
 	if err != nil {
 		return nil, err
 	}
